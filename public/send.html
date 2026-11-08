@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>קול – משדר</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<main>
+  <h1>🔊 משדר</h1>
+  <p class="sub">פותחים את הדף הזה במחשב המרוחק (Chrome או Edge)</p>
+
+  <div class="card">
+    <label for="room">שם חדר</label>
+    <input id="room" value="main" autocomplete="off">
+    <label for="key">קוד גישה</label>
+    <input id="key" type="password" autocomplete="off">
+    <div class="row">
+      <div>
+        <label for="rate">איכות</label>
+        <select id="rate">
+          <option value="16000">נמוכה (16kHz)</option>
+          <option value="24000" selected>רגילה (24kHz)</option>
+          <option value="48000">גבוהה (48kHz)</option>
+        </select>
+      </div>
+      <div>
+        <label for="channels">ערוצים</label>
+        <select id="channels">
+          <option value="2" selected>סטריאו</option>
+          <option value="1">מונו</option>
+        </select>
+      </div>
+    </div>
+    <button id="start">התחל לשדר</button>
+    <button id="stop" class="secondary" hidden>עצור</button>
+    <div class="meter"><div id="level"></div></div>
+    <div id="status" class="status"></div>
+  </div>
+
+  <div class="card">
+    <ol class="hint">
+      <li>לוחצים "התחל לשדר".</li>
+      <li>בחלון שנפתח בוחרים <b>מסך מלא</b> (Entire screen).</li>
+      <li>מסמנים <b>"שתף גם את אודיו המערכת"</b> (Share system audio) ולוחצים שיתוף.</li>
+      <li>אפשר למזער את החלון – רק לא לסגור את הלשונית.</li>
+    </ol>
+    <p class="hint">קליטת קול המערכת עובדת ב-Chrome וב-Edge על Windows (וגם ב-ChromeOS). ב-Mac אפשר לשתף רק קול של לשונית דפדפן.</p>
+  </div>
+</main>
+<script src="/common.js"></script>
+<script>
+loadField('room'); loadField('key'); loadField('rate'); loadField('channels');
+
+let ws, stream, ctx, node, wakeLock, stopped = true, retryTimer;
+const $ = (id) => document.getElementById(id);
+
+function connect() {
+  const sampleRate = +$('rate').value, channels = +$('channels').value;
+  ws = new WebSocket(wsUrl('sender', $('room').value, $('key').value));
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ type: 'config', sampleRate, channels }));
+    setStatus('משדר ✓ – ממתין למאזינים', 'ok');
+  };
+  ws.onmessage = (e) => {
+    const m = JSON.parse(e.data);
+    if (m.type === 'listeners') setStatus(m.count ? `משדר ✓ – ${m.count} מאזינים` : 'משדר ✓ – ממתין למאזינים', 'ok');
+    if (m.type === 'error') { setStatus(m.message, 'bad'); if (m.message.includes('קוד')) stop(); }
+  };
+  ws.onclose = (e) => {
+    if (stopped || e.code === 4001 || e.code === 4002) return;
+    setStatus('החיבור נותק, מתחבר מחדש…', 'bad');
+    retryTimer = setTimeout(connect, 2000);
+  };
+}
+
+async function start() {
+  ['room', 'key', 'rate', 'channels'].forEach(saveField);
+  try {
+    stream = await navigator.mediaDevices.getDisplayMedia({
+      video: true,
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+      systemAudio: 'include',
+      selfBrowserSurface: 'exclude',
+    });
+  } catch (e) {
+    return setStatus('השיתוף בוטל', 'bad');
+  }
+  const audio = stream.getAudioTracks();
+  stream.getVideoTracks().forEach((t) => t.stop()); // לא צריך את התמונה
+  if (!audio.length) {
+    stream.getTracks().forEach((t) => t.stop());
+    return setStatus('לא נבחר קול. נסה שוב וסמן "שתף גם את אודיו המערכת".', 'bad');
+  }
+  audio[0].onended = stop;
+
+  ctx = new AudioContext({ latencyHint: 'interactive' });
+  await ctx.audioWorklet.addModule('/capture-worklet.js');
+  const src = ctx.createMediaStreamSource(new MediaStream(audio));
+  node = new AudioWorkletNode(ctx, 'capture-processor', {
+    numberOfOutputs: 0,
+    processorOptions: { outRate: +$('rate').value, channels: +$('channels').value },
+  });
+  node.port.onmessage = (e) => {
+    if (e.data instanceof ArrayBuffer) {
+      // אם הרשת איטית מדלגים על חבילה, כדי לא לצבור עיכוב
+      if (ws && ws.readyState === 1 && ws.bufferedAmount < 64 * 1024) ws.send(e.data);
+    } else if (e.data.level !== undefined) {
+      $('level').style.width = Math.min(100, e.data.level * 100) + '%';
+    }
+  };
+  src.connect(node);
+
+  stopped = false;
+  connect();
+  try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
+  $('start').hidden = true; $('stop').hidden = false;
+}
+
+function stop() {
+  stopped = true;
+  clearTimeout(retryTimer);
+  try { ws && ws.close(); } catch {}
+  stream && stream.getTracks().forEach((t) => t.stop());
+  ctx && ctx.close();
+  try { wakeLock && wakeLock.release(); } catch {}
+  ws = stream = ctx = node = wakeLock = null;
+  $('level').style.width = '0';
+  $('start').hidden = false; $('stop').hidden = true;
+  setStatus('השידור הופסק');
+}
+
+$('start').onclick = start;
+$('stop').onclick = stop;
+</script>
+</body>
+</html>

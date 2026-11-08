@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>קול – מאזין</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<main>
+  <h1>🎧 מאזין</h1>
+  <p class="sub">פותחים אצלך, עם האוזניות מחוברות</p>
+
+  <div class="card">
+    <label for="room">שם חדר</label>
+    <input id="room" value="main" autocomplete="off">
+    <label for="key">קוד גישה</label>
+    <input id="key" type="password" autocomplete="off">
+    <label for="delay">השהיה (פחות = מהיר יותר, יותר = יציב יותר)</label>
+    <select id="delay">
+      <option value="0.08">נמוכה מאוד</option>
+      <option value="0.15" selected>רגילה</option>
+      <option value="0.35">יציבה</option>
+      <option value="0.7">רשת חלשה</option>
+    </select>
+    <button id="start">התחל להאזין</button>
+    <button id="stop" class="secondary" hidden>עצור</button>
+    <label for="vol">עוצמה</label>
+    <input id="vol" type="range" min="0" max="2" step="0.05" value="1">
+    <div class="meter"><div id="level"></div></div>
+    <div id="status" class="status"></div>
+  </div>
+</main>
+<script src="/common.js"></script>
+<script>
+loadField('room'); loadField('key'); loadField('delay');
+
+let ws, ctx, gain, nextTime = 0, cfg = null, stopped = true, retryTimer, peak = 0;
+const $ = (id) => document.getElementById(id);
+
+function connect() {
+  ws = new WebSocket(wsUrl('listener', $('room').value, $('key').value));
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => setStatus('מחובר, ממתין למשדר…');
+  ws.onmessage = (e) => {
+    if (e.data instanceof ArrayBuffer) return play(e.data);
+    const m = JSON.parse(e.data);
+    if (m.type === 'config') { cfg = m; nextTime = 0; setStatus('מנגן ✓', 'ok'); }
+    if (m.type === 'sender-gone') { cfg = null; setStatus('המשדר לא פעיל כרגע – ממתין…'); }
+    if (m.type === 'error') { setStatus(m.message, 'bad'); stop(true); }
+  };
+  ws.onclose = (e) => {
+    if (stopped || e.code === 4001) return;
+    setStatus('החיבור נותק, מתחבר מחדש…', 'bad');
+    retryTimer = setTimeout(connect, 2000);
+  };
+}
+
+function play(buf) {
+  if (!cfg || !ctx) return;
+  const ch = cfg.channels, pcm = new Int16Array(buf), frames = pcm.length / ch;
+  if (!frames) return;
+  const ab = ctx.createBuffer(ch, frames, cfg.sampleRate);
+  for (let c = 0; c < ch; c++) {
+    const out = ab.getChannelData(c);
+    for (let i = 0; i < frames; i++) {
+      const v = pcm[i * ch + c] / 32768;
+      out[i] = v;
+      if (Math.abs(v) > peak) peak = Math.abs(v);
+    }
+  }
+  const target = +$('delay').value, now = ctx.currentTime;
+  if (nextTime < now + 0.01) nextTime = now + target;        // נגמר המאגר – מתחילים מחדש
+  else if (nextTime > now + target + 0.25) return;            // הצטבר עיכוב – מדלגים כדי להדביק
+  const src = ctx.createBufferSource();
+  src.buffer = ab;
+  src.connect(gain);
+  src.start(nextTime);
+  nextTime += ab.duration;
+}
+
+async function start() {
+  ['room', 'key', 'delay'].forEach(saveField);
+  ctx = new AudioContext({ latencyHint: 'interactive' });
+  await ctx.resume();
+  gain = ctx.createGain();
+  gain.gain.value = +$('vol').value;
+  gain.connect(ctx.destination);
+  stopped = false;
+  connect();
+  $('start').hidden = true; $('stop').hidden = false;
+  if ('mediaSession' in navigator) navigator.mediaSession.metadata = new MediaMetadata({ title: 'קול – שידור חי' });
+}
+
+function stop(keepStatus) {
+  stopped = true;
+  clearTimeout(retryTimer);
+  try { ws && ws.close(); } catch {}
+  ctx && ctx.close();
+  ws = ctx = gain = cfg = null;
+  $('start').hidden = false; $('stop').hidden = true;
+  if (keepStatus !== true) setStatus('ההאזנה הופסקה');
+}
+
+setInterval(() => { $('level').style.width = Math.min(100, peak * 100) + '%'; peak = 0; }, 100);
+$('vol').oninput = () => { if (gain) gain.gain.value = +$('vol').value; };
+$('start').onclick = start;
+$('stop').onclick = () => stop();
+document.addEventListener('visibilitychange', () => { if (ctx && ctx.state === 'suspended') ctx.resume(); });
+</script>
+</body>
+</html>
